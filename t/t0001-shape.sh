@@ -11,8 +11,8 @@ own_instance 1 "$@"
 
 flux R encode --hosts=flux-lead,c[1-8],nwqsim-head --cores=0-3 \
     --property=normal:1-8 --property=qfw-service:9 > "$WORK/R.json"
-python3 -m flux_qfw.cli add --r "$WORK/R.json" --output "$WORK/R-q.json" nwqsim
-python3 -m flux_qfw.cli devices --r "$WORK/R-q.json" | grep -q '^nwqsim qpus=1$' || fail "device missing from graph"
+python3 -m flux_qfw.cli add --r "$WORK/R.json" --output "$WORK/R-q.json" nwqsim:32
+grep -q '^nwqsim qpus=1 qubits=32$' <<<"$(python3 -m flux_qfw.cli devices --r "$WORK/R-q.json")" || fail "device missing from graph"
 pass "qdevice_nwqsim -> qpu added at the cluster root"
 
 QMANAGER_POLICY=coschedule load_fluxion "$WORK/R-q.json"

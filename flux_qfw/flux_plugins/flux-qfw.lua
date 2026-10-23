@@ -130,6 +130,17 @@ local function job_hostlist()
     return read_last_line("flux hostlist -e -d , " .. shell_quote(table.concat(parts, ",")))
 end
 
+-- The job's id as text. shell.info.jobid is a Lua number, a double, so
+-- tostring turns a large id into something like 1.66e+14 and loses digits.
+-- The shell puts the exact id in FLUX_JOB_ID, so we use that.
+local function job_id()
+    local id = shell.getenv("FLUX_JOB_ID")
+    if id and id ~= "" then
+        return id
+    end
+    return string.format("%.0f", shell.info.jobid)
+end
+
 local function export(value, sid)
     shell.setenv("QFW_RESERVATIONS", value)
     shell.setenv("QFW_QPU_SERVICE_ID", sid)
@@ -179,7 +190,7 @@ plugin.register {
                 if shell.info.rank ~= 0 then
                     return  -- the other ranks read the memo in shell.post-init
                 end
-                local jobid = tostring(shell.info.jobid)
+                local jobid = job_id()
                 if qfw.hold then
                     -- The user's half of a scout pair. The scout memoed the
                     -- reservation before it released this job, and it keeps
@@ -240,7 +251,7 @@ plugin.register {
                     return
                 end
                 -- Rank 0 posted the memo before the init barrier.
-                local jobid = tostring(shell.info.jobid)
+                local jobid = job_id()
                 local line = read_last_line(string.format(
                     "%s memo --jobid %s", helper(qfw), jobid))
                 if not line then

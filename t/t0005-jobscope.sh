@@ -10,7 +10,7 @@ export FLUX_QFW_BACKEND=mock
 export FLUX_QFW_MOCK_DIR="$WORK/mock"
 
 flux R encode --hosts=fakeA,fakeB --cores=0-1 --property=normal:0-1 > "$WORK/R.json"
-python3 -m flux_qfw.cli add --r "$WORK/R.json" --output "$WORK/R-q.json" nwqsim shim
+python3 -m flux_qfw.cli add --r "$WORK/R.json" --output "$WORK/R-q.json" nwqsim:32 shim:20
 load_fluxion "$WORK/R-q.json"
 # Add a [qfw] table next to the resource config lib.sh loaded.
 flux config get | python3 -c '

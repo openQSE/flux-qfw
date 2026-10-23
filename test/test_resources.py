@@ -81,7 +81,17 @@ class ShapeTest(unittest.TestCase):
         self.assertEqual(len(after), 2)
         dev = after[1]
         self.assertEqual(dev["type"], "qdevice_nwqsim")
-        self.assertEqual(dev["with"][0], {"type": "qpu", "count": 1, "exclusive": True})
+        self.assertEqual(
+            dev["with"][0],
+            {
+                "type": "qpu",
+                "count": 1,
+                "exclusive": True,
+                "with": [{"type": "qubit", "count": 1}],
+            },
+        )
+        wide = resources.add_device(before, "nwqsim", qubits=5)
+        self.assertEqual(wide[1]["with"][0]["with"], [{"type": "qubit", "count": 5}])
 
     def test_add_device_refuses_duplicate_and_bad_input(self):
         once = resources.add_device(classical(), "nwqsim")
@@ -151,7 +161,7 @@ class ShapeTest(unittest.TestCase):
         doc = {
             "graph": {"nodes": [root, node], "edges": [{"source": "0", "target": "1"}]}
         }
-        added = resources.add_devices_to_graph(doc, [("nwqsim", 1), ("fake-iqm", 2)])
+        added = resources.add_devices_to_graph(doc, ["nwqsim:32", ("fake-iqm", 2, 20)])
         self.assertEqual(added, ["nwqsim", "fake-iqm"])
         self.assertEqual(resources.devices_in(doc), {"nwqsim": 1, "fake-iqm": 2})
         paths = sorted(
@@ -164,11 +174,15 @@ class ShapeTest(unittest.TestCase):
                 "/cluster0/c1",
                 "/cluster0/qdevice_fake-iqm0",
                 "/cluster0/qdevice_fake-iqm0/qpu0",
+                "/cluster0/qdevice_fake-iqm0/qpu0/qubit0",
                 "/cluster0/qdevice_fake-iqm0/qpu1",
+                "/cluster0/qdevice_fake-iqm0/qpu1/qubit0",
                 "/cluster0/qdevice_nwqsim0",
                 "/cluster0/qdevice_nwqsim0/qpu0",
+                "/cluster0/qdevice_nwqsim0/qpu0/qubit0",
             ],
         )
+        self.assertEqual(resources.device_qubits(doc), {"nwqsim": 32, "fake-iqm": 20})
         # New vertex ids continue after the highest one and stay unique.
         ids = [int(n["id"]) for n in doc["graph"]["nodes"]]
         self.assertEqual(sorted(ids), list(range(len(ids))))
@@ -179,6 +193,74 @@ class ShapeTest(unittest.TestCase):
         self.assertEqual(resources.add_devices_to_graph(doc, [("nwqsim", 1)]), [])
         self.assertEqual(resources.devices_in(doc), {"nwqsim": 1, "fake-iqm": 2})
         json.dumps(doc)
+
+    def test_parse_spec(self):
+        self.assertEqual(resources.parse_spec("nwqsim"), ("nwqsim", 1, 1))
+        self.assertEqual(resources.parse_spec("fake-iqm=2"), ("fake-iqm", 2, 1))
+        self.assertEqual(resources.parse_spec("fake-iqm=2:20"), ("fake-iqm", 2, 20))
+        self.assertEqual(resources.parse_spec("nwqsim:32"), ("nwqsim", 1, 32))
+        self.assertEqual(resources.parse_spec(("nwqsim", 1)), ("nwqsim", 1, 1))
+        with self.assertRaises(ValueError):
+            resources.parse_spec("nwqsim:0")
+
+    def test_device_qubits_without_pool(self):
+        # A graph built before qubits were modeled has none to match.
+        self.assertEqual(
+            resources.device_qubits(graph_with({"nwqsim": 1})), {"nwqsim": None}
+        )
+
+
+def cluster(*cores, props=None):
+    """Return a graph with one node per entry in cores, each with that many cores."""
+    nodes = [{"id": "0", "metadata": {"type": "cluster"}}]
+    edges = []
+    nid = 1
+    for i, n in enumerate(cores):
+        meta = {"type": "node", "properties": (props or {}).get(i, {})}
+        nodes.append({"id": str(nid), "metadata": meta})
+        edges.append({"source": "0", "target": str(nid)})
+        node, nid = nid, nid + 1
+        for _ in range(n):
+            nodes.append({"id": str(nid), "metadata": {"type": "core"}})
+            edges.append({"source": str(node), "target": str(nid)})
+            nid += 1
+    return {"graph": {"nodes": nodes, "edges": edges}}
+
+
+class ScoutRoomTest(unittest.TestCase):
+    def test_spare_core_on_the_node(self):
+        self.assertIsNone(resources.fits_with_scout(cluster(4), classical(1, 3)))
+        self.assertIn("no core", resources.fits_with_scout(cluster(4), classical(1, 4)))
+
+    def test_spare_node(self):
+        self.assertIsNone(resources.fits_with_scout(cluster(4, 4), classical(1, 4)))
+        self.assertIsNotNone(resources.fits_with_scout(cluster(4, 4), classical(2, 4)))
+        # A small node no classical node would fit still holds the scout.
+        self.assertIsNone(resources.fits_with_scout(cluster(4, 4, 1), classical(2, 4)))
+
+    def test_whole_nodes_need_another_node(self):
+        whole = classical(1, 2)
+        whole[0]["exclusive"] = True
+        self.assertIn("whole nodes", resources.fits_with_scout(cluster(4), whole))
+        self.assertIsNone(resources.fits_with_scout(cluster(4, 4), whole))
+
+    def test_too_few_nodes(self):
+        self.assertIn(
+            "asks for 3", resources.fits_with_scout(cluster(4, 4), classical(3, 1))
+        )
+
+    def test_properties_narrow_the_nodes(self):
+        doc = cluster(4, 4, props={0: {"normal": ""}})
+        self.assertIsNone(resources.fits_with_scout(doc, classical(1, 4)))
+        self.assertIsNotNone(
+            resources.fits_with_scout(doc, classical(1, 4), {"properties": ["normal"]})
+        )
+        # Anything but a plain property list is left to the scheduler.
+        self.assertIsNone(
+            resources.fits_with_scout(
+                doc, classical(1, 4), {"not": [{"properties": ["normal"]}]}
+            )
+        )
 
 
 if __name__ == "__main__":

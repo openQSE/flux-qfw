@@ -3,21 +3,25 @@
 A device behind a vendor queue is not ready just because Fluxion granted it.
 So flux submit --qfw-qpu on such a device submits two jobs.
 
-The scout job asks for one core and the exclusive qpu. It waits in the queue
-like any job, so it only runs while it holds a lease. That means the number
-of open vendor sessions is never more than the number of leases. This module
-is the scout job's program.
-
 The user's job asks for its normal nodes and no device. It is submitted
-held. Under the coschedule policy Fluxion keeps its nodes reserved but does
-not start it.
+first, and held. Under the coschedule policy Fluxion keeps its nodes
+reserved but does not start it.
+
+The scout job is submitted next, with the user's job id in its qfw.partner.
+It asks for one core and the exclusive qpu. It waits in the queue like any
+job, so it only runs while it holds a lease. That means the number of open
+vendor sessions is never more than the number of leases. This module is the
+scout job's program.
 
 When the scout starts, running as the user, it does these things in order.
 
-1. Find its partner, the held job whose qfw.scout is this job's id.
+1. Read its partner from qfw.partner. If the partner already ended, exit.
 2. Open a session on the vendor queue and memo qfw_session onto the partner.
 3. Wait for the session. If the partner is cancelled meanwhile, close the
-   session and exit.
+   session and exit. If the session is not ready within the session wait,
+   counted from when the scout started, close it and fail the partner. The
+   scout's time limit is that wait plus the partner's duration, so a scout
+   that gets this far outlives the partner.
 4. When the session is ready, memo qfw_reservations and released onto the
    partner, then release its hold. The partner's shell exports the memo as
    QFW_RESERVATIONS. The released memo stops the qmanager from holding the
@@ -49,7 +53,7 @@ from .qpm import JobIdentity, SessionError, get_backend
 from .qpm.base import encode_reservations
 
 RELEASE_TOPIC = "sched-fluxion-qmanager.release"
-PARTNER_TIMEOUT = 60.0
+SESSION_WAIT_DEFAULT = 3600.0
 
 
 def log(fmt, *args):
@@ -120,44 +124,10 @@ def release_hold(handle, jobid):
     handle.rpc(RELEASE_TOPIC, {"id": int(jobid)}).get()
 
 
-def user_jobs(handle, userid):
-    """Return one user's jobs in any state, newest first."""
-    payload = {
-        "max_entries": 1000,
-        "attrs": ["userid", "state"],
-        "userid": int(userid),
-        "states": 0,
-    }
-    return handle.rpc("job-list.list", payload).get()["jobs"]
-
-
-def find_partner(handle, my_id, userid, timeout_s=PARTNER_TIMEOUT, poll_s=1.0):
-    """Return (job id, ended) for the job whose qfw.scout names this scout.
-
-    Finished jobs count too. A scout can wait in the queue for a lease while
-    its partner is cancelled, and it should exit right away when it starts,
-    not hold the lease while it looks. Returns (None, False) if no job names
-    this scout before the timeout.
-    """
-    deadline = time.time() + timeout_s
-    while True:
-        for job in user_jobs(handle, userid):
-            try:
-                system = job_system(handle, job["id"])
-            except Exception:
-                continue
-            qfw = system.get("qfw") or {}
-            if system.get("hold") and qfw.get("scout") == my_id:
-                ended = not (job.get("state", 0) & flux.constants.FLUX_JOB_STATE_ACTIVE)
-                return int(job["id"]), ended
-        if time.time() >= deadline:
-            return None, False
-        time.sleep(poll_s)
-
-
-def scout(partner=None, poll_s=2.0, partner_timeout_s=PARTNER_TIMEOUT, handle=None):
+def scout(partner=None, poll_s=2.0, handle=None):
     """Run the scout for the job this process belongs to. Returns the exit code."""
     h = handle or flux.Flux()
+    started = time.time()
     my_id = os.environ.get("FLUX_JOB_ID")
     if not my_id:
         log("FLUX_JOB_ID is not set; the scout only runs as the program of a scout job")
@@ -171,20 +141,18 @@ def scout(partner=None, poll_s=2.0, partner_timeout_s=PARTNER_TIMEOUT, handle=No
         return 2
     service_id = envelope.qpu
     backend = get_backend(me.get("backend"))
+    deadline = started + float(me.get("session_wait") or SESSION_WAIT_DEFAULT)
 
+    partner = partner or me.get("partner")
     if partner is None:
-        partner, ended = find_partner(h, my_id, userid, partner_timeout_s)
-        if partner is None:
-            log(
-                "no held job names scout {} after {:.0f}s, so there is nothing to do",
-                my_id,
-                partner_timeout_s,
-            )
-            return 0
-        if ended:
-            log("job {} already ended, so scout {} has nothing to do", partner, my_id)
-            return 0
+        log("job {} names no partner; was it submitted by the flux-qfw plugin?", my_id)
+        return 2
     partner = int(flux.job.JobID(partner))
+    # A scout can wait in the queue for a lease while its partner is
+    # cancelled. Then it should give the lease back right away.
+    if job_state(h, partner) == "INACTIVE":
+        log("job {} already ended, so scout {} has nothing to do", partner, my_id)
+        return 0
     log("scout {} holds {} for job {}", my_id, service_id, partner)
     try:
         username = pwd.getpwuid(userid).pw_name
@@ -232,7 +200,6 @@ def scout(partner=None, poll_s=2.0, partner_timeout_s=PARTNER_TIMEOUT, handle=No
         partner,
         qfw_session=session.session_id,
         qfw_session_state=session.state,
-        qfw_scout=my_id,
     )
     log("session {} opened on {} ({})", session.session_id, service_id, session.state)
 
@@ -240,6 +207,15 @@ def scout(partner=None, poll_s=2.0, partner_timeout_s=PARTNER_TIMEOUT, handle=No
         if job_state(h, partner) == "INACTIVE":
             close("partner ended while queued")
             return 0
+        if time.time() >= deadline:
+            close("not ready within the session wait")
+            job_raise(
+                partner,
+                "flux-qfw: the session on {} was not ready within {:.0f}s".format(
+                    service_id, deadline - started
+                ),
+            )
+            return 1
         time.sleep(poll_s)
         session = backend.session_status(service_id, session.session_id)
         if session.state == "failed":
@@ -286,7 +262,8 @@ def sessions(handle=None):
     """Return the scout pairs in flight.
 
     Each row is (job id, device, scout id, scout state, session id, state),
-    for every user's job that is still pending or running.
+    for every user's job that is still pending or running. The scout id
+    comes from the qfw_scout memo the CLI plugin posts on the user's job.
     """
     h = handle or flux.Flux()
     out = []
@@ -308,12 +285,7 @@ def sessions(handle=None):
             or qfw.get("pair") != "classical"
         ):
             continue
-        scout_id = qfw.get("scout")
-        try:
-            scout_state = job_state(h, scout_id) if scout_id else "none"
-        except Exception:
-            scout_state = "unknown"
-        session_id, state = None, "waiting for the scout"
+        scout_id, session_id, state = None, None, "waiting for the scout"
         eventlog = data.get("eventlog") or ""
         lines = eventlog.splitlines() if isinstance(eventlog, str) else eventlog
         for line in lines:
@@ -324,11 +296,17 @@ def sessions(handle=None):
             if event.get("name") != "memo":
                 continue
             ctx = event.get("context") or {}
+            if "qfw_scout" in ctx:
+                scout_id = int(ctx["qfw_scout"])
             if "qfw_session" in ctx:
                 session_id = str(ctx["qfw_session"])
                 state = "session {}".format(ctx.get("qfw_session_state", "queued"))
             if "released" in ctx:
                 state = "released, waiting for nodes"
+        try:
+            scout_state = job_state(h, scout_id) if scout_id else "none"
+        except Exception:
+            scout_state = "unknown"
         if job_state(h, jobid) == "RUN":
             state = "running with the session"
         out.append((jobid, qfw.get("qpu"), scout_id, scout_state, session_id, state))
