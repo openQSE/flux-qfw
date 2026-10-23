@@ -13,9 +13,9 @@ export FLUX_QFW_MOCK_DIR="$WORK/mock"
 # A fixed size node, so the result does not depend on how many cores this
 # machine has. load_fluxion sets noverify, so the cores need not exist.
 flux R encode --hosts="$(hostname)" --cores=0-7 --property=normal:0 > "$WORK/R.json"
-python3 -m flux_qfw.cli add --r "$WORK/R.json" --output "$WORK/R-q.json" nwqsim
+python3 -m flux_qfw.cli add --r "$WORK/R.json" --output "$WORK/R-q.json" nwqsim:32
 load_fluxion "$WORK/R-q.json"
-python3 -m flux_qfw.cli devices | grep -q '^nwqsim qpus=1$' || fail "instance graph has no device"
+grep -q '^nwqsim qpus=1 qubits=32$' <<<"$(python3 -m flux_qfw.cli devices)" || fail "instance graph has no device"
 pass "instance loaded with a local node and qdevice_nwqsim"
 
 if flux run --dry-run -n1 --qfw-qpu=nwqsim hostname >/dev/null 2>"$WORK/err0"; then
@@ -34,10 +34,32 @@ if flux run --dry-run -N1 -n1 --qfw-qpu=nosuch hostname >/dev/null 2>"$WORK/err"
 fi
 grep -q "no QPM 'nosuch'" "$WORK/err" && pass "unknown QPM refused at submit"
 
+# The qpu asks for the envelope's qubits, one unless the user says more, so
+# Fluxion only matches a device that wide.
+flux run --dry-run -N1 -n1 --qfw-qpu=nwqsim hostname \
+    | jq -e '.resources[1].with[0].with == [{"type": "qubit", "count": 1}]' >/dev/null \
+    || fail "the qpu does not ask for one qubit by default"
+jq -e '.resources[1].with[0].with == [{"type": "qubit", "count": 5}]' "$WORK/dry.json" >/dev/null \
+    || fail "the qpu does not ask for --qfw-max-qubits"
+if flux run --dry-run -N1 -n1 --qfw-qpu=nwqsim --qfw-max-qubits=33 hostname >/dev/null 2>"$WORK/err1"; then
+    fail "a job wider than the device was accepted"
+fi
+grep -q "has 32 qubits and the job asks for 33" "$WORK/err1" || { cat "$WORK/err1"; fail "qubit refusal message"; }
+J=$(flux submit -N1 -n1 --qfw-qpu=nwqsim --qfw-max-qubits=32 --qfw-no-reserve true)
+flux job wait-event -t 15 "$J" alloc >/dev/null || fail "a job as wide as the device did not allocate"
+flux job info "$J" R | jq -e '[.scheduling.graph.nodes[].metadata.type] | any(. == "qubit")' >/dev/null \
+    || fail "the job's R has no qubits"
+flux job wait-event -t 15 "$J" clean >/dev/null
+pass "Fluxion matches the qpu by its qubits: one by default, refused when too wide"
+
 flux run -N1 -n1 --qfw-qpu=nwqsim --qfw-max-qubits=5 --qfw-circ-count=3 \
     sh -c 'echo "RES=$QFW_RESERVATIONS SID=$QFW_QPU_SERVICE_ID"' > "$WORK/out" 2>"$WORK/log"
 grep -Eq '^RES=\[\["nwqsim","[0-9]+"\]\] SID=nwqsim$' "$WORK/out" || { cat "$WORK/out" "$WORK/log"; fail "task did not see QFW_RESERVATIONS"; }
 pass "task received QFW_RESERVATIONS in QFw's tuple format"
+# The shell must use the exact job id from FLUX_JOB_ID. A Lua number would
+# print a large id like 1.66e+14 and break every helper call.
+grep -q 'flux-qfw: job ƒ' "$WORK/log" || { cat "$WORK/log"; fail "the shell did not use the exact job id from FLUX_JOB_ID"; }
+pass "the shell names the job by its exact id"
 grep -q 'flux-qfw: unregistered reservation' "$WORK/log" || { cat "$WORK/log"; fail "shell did not unregister"; }
 n_released=$(cat "$WORK/mock"/*.json | jq -s '[.[] | select(.state == "released")] | length')
 [ "$n_released" = 1 ] || fail "mock backend shows $n_released released reservations"

@@ -12,6 +12,7 @@ test: unit check-flux
 	bash t/t0004-multinode.sh
 	bash t/t0005-jobscope.sh
 	bash t/t0006-external-queue.sh
+	bash t/t0007-add.sh
 
 unit:
 	$(PY) -m unittest discover -s test -p 'test_*.py' -v

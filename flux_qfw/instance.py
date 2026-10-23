@@ -60,16 +60,17 @@ def load_instance_graph(handle=None):
 def add_devices(specs, handle=None):
     """Add devices to a running instance.
 
-    specs is a list of (service_id, count). Devices already present are
-    skipped. The live graph's root is sent along with the new vertices so
-    Fluxion attaches them under it. Only the instance owner can do this.
+    specs is a list of device specs (see resources.parse_spec). Devices
+    already present are skipped. The live graph's root is sent along with
+    the new vertices so Fluxion attaches them under it. Only the instance
+    owner can do this.
     Returns the service ids that were added.
     """
     handle = handle or flux.Flux()
     live = live_graph(handle)
     graph = resources.graph_of(live)
     present = resources.devices_in(live)
-    todo = [(sid, n) for sid, n in specs if sid not in present]
+    todo = [s for s in map(resources.parse_spec, specs) if s[0] not in present]
     if not todo:
         return []
     root = resources.root_of(graph)
@@ -79,7 +80,21 @@ def add_devices(specs, handle=None):
         "sched-fluxion-resource.add_subgraph",
         {"subgraph": json.dumps({"graph": {"nodes": [root] + nodes, "edges": edges}})},
     ).get()
-    return [sid for sid, _ in todo]
+    return [s[0] for s in todo]
+
+
+def r_from_config(path):
+    """Return the R that flux R parse-config builds from a broker config."""
+    result = subprocess.run(
+        ["flux", "R", "parse-config", path],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise ValueError(
+            "flux R parse-config {} failed: {}".format(path, result.stderr.strip())
+        )
+    return json.loads(result.stdout)
 
 
 def encode_r(doc):

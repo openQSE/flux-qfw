@@ -5,12 +5,14 @@
 It runs in the user's process when they submit, and only shapes the jobspec.
 
 For a device the site owns, the classical request stays as flux built it and
-a second entry asks for the exclusive qpu. Fluxion gives the job both at
-once, or the job waits while the device is busy, just like a busy core.
+a second entry asks for the exclusive qpu, with as many qubits as the
+envelope's max_qubits. Fluxion gives the job both at once, or the job waits
+while the device is busy, just like a busy core.
 
-For a device behind a vendor queue, one submit becomes two jobs. A scout job
-asks for one core and the qpu. The user's job is held and asks for no device.
-The scout releases it once the vendor is ready. See scout.py.
+For a device behind a vendor queue, one submit becomes two jobs. The user's
+job is submitted first, held, and asks for no device. Then a scout job is
+submitted with the user's job id as its partner. It asks for one core and
+the qpu, and releases the user's job once the vendor is ready. See scout.py.
 
 The envelope goes into attributes.system.qfw for the shell plugin, and the
 shell plugin is added through the userrc shell option, so the site does not
@@ -18,11 +20,13 @@ need any shell configuration.
 """
 
 import copy
+import json
 import os
 import sys
 
 import flux
 import flux.job
+import flux.util
 from flux.cli.plugin import CLIPlugin
 from flux.job import JobspecV1
 
@@ -33,6 +37,14 @@ USERRC = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "flux_plugins", "flux-qfw.lua"
 )
 _ACTIVE_PROGS = ("submit", "run", "batch", "bulksubmit", "alloc")
+
+# How long a scout waits for the vendor before it gives up, unless the device
+# or the job says otherwise.
+SESSION_WAIT_DEFAULT = 3600.0
+
+# Slack between the scout's release of the user's job and that job starting.
+# The scout's time limit covers the wait, the user's duration, and this.
+SCOUT_MARGIN = 60.0
 
 
 def envelope_from_args(args):
@@ -89,11 +101,12 @@ def instance_graph_or_none():
         return None
 
 
-def check_device_known(service_id, doc):
-    """Refuse the job now when the graph has no such device.
+def check_device_known(service_id, doc, qubits=1):
+    """Refuse the job now when the graph has no such device, or it is too narrow.
 
-    Fluxion would refuse it later with a bare "type must be known". This
-    names the devices the graph does have.
+    Fluxion would refuse it later with a bare "type must be known" or
+    "unsatisfiable". This names the devices the graph does have, and how
+    many qubits the device has.
     """
     if doc is None:
         return
@@ -102,6 +115,18 @@ def check_device_known(service_id, doc):
         raise ValueError(
             "no QPM {!r} in the resource graph; known: {}".format(
                 service_id, ", ".join(sorted(known)) or "none"
+            )
+        )
+    width = resources.device_qubits(doc).get(service_id)
+    if width is None:
+        raise ValueError(
+            "QPM {!r} has no qubits in the resource graph; add it again with "
+            "flux-qfw add {}=QPUS:QUBITS".format(service_id, service_id)
+        )
+    if qubits > width:
+        raise ValueError(
+            "QPM {!r} has {} qubits and the job asks for {}".format(
+                service_id, width, qubits
             )
         )
 
@@ -180,6 +205,13 @@ class QfwCLIPlugin(CLIPlugin):
             "queue, so a scout job holds it and this job waits until the vendor "
             "is ready. Defaults to the device's [qfw] config",
         )
+        self.add_option(
+            "--session-wait",
+            metavar="FSD",
+            help="how long the scout waits for a vendor session before the job "
+            "fails, like 30m or 2h. Defaults to the device's session-wait, "
+            "or 1h",
+        )
 
     def modify_jobspec(self, args, jobspec):
         try:
@@ -191,7 +223,7 @@ class QfwCLIPlugin(CLIPlugin):
         raw = jobspec.jobspec
         doc = instance_graph_or_none()
         try:
-            check_device_known(envelope.qpu, doc)
+            check_device_known(envelope.qpu, doc, envelope.max_qubits)
             classical = raw["resources"]
             if doc is not None:
                 # A graph with sockets needs every level named, or the flat
@@ -200,7 +232,7 @@ class QfwCLIPlugin(CLIPlugin):
                     classical, resources.node_to_core_path(doc)
                 )
             raw["resources"] = resources.add_device(
-                classical, envelope.qpu, envelope.qpus
+                classical, envelope.qpu, envelope.qpus, envelope.max_qubits
             )
         except ValueError as error:
             raise SystemExit("flux-qfw: {}".format(error))
@@ -236,6 +268,11 @@ class QfwCLIPlugin(CLIPlugin):
                 )
             )
         attr["queue"] = queue
+        if queue == "external":
+            try:
+                attr["session_wait"] = session_wait(args, spec)
+            except ValueError as error:
+                raise SystemExit("flux-qfw: {}".format(error))
         if spec.get("launch-agent"):
             attr["launch_agent"] = spec["launch-agent"]
         attr["backend"] = (
@@ -250,33 +287,151 @@ class QfwCLIPlugin(CLIPlugin):
         attr["pythonpath"] = os.environ.get("PYTHONPATH", "")
         attr["hold"] = queue == "external" and attr["reserve"]
         if attr["hold"]:
+            # The held job's nodes are reserved, so its scout needs a core
+            # outside them, or it never starts and the job waits forever.
+            system = raw.get("attributes", {}).get("system", {}) or {}
+            reason = (
+                resources.fits_with_scout(doc, classical, system.get("constraints"))
+                if doc is not None
+                else None
+            )
+            if reason:
+                raise SystemExit(
+                    "flux-qfw: {} is behind a vendor queue and needs one more core "
+                    "for its scout, but {}".format(envelope.qpu, reason)
+                )
             raw["resources"] = classical
             jobspec.setattr("system.hold", True)
             attr["pair"] = "classical"
-            attr["scout"] = (
-                None
-                if getattr(args, "dry_run", False)
-                else submit_scout(jobspec, envelope, attr, classical)
-            )
+            install_scout_submitter()
         jobspec.setattr("system.qfw", attr)
         jobspec.setattr_shell_option(
             "userrc", os.environ.get("FLUX_QFW_USERRC", USERRC)
         )
 
 
-def submit_scout(jobspec, envelope, attr, classical):
-    """Submit the scout job for an external device and return its id.
+def session_wait(args, spec):
+    """Return how many seconds the scout waits for the vendor.
+
+    The option wins over the device's session-wait. Both take a Flux
+    duration like 30m, or a number of seconds.
+    """
+    value = getattr(args, "session_wait", None) or spec.get("session-wait")
+    if value is None:
+        return SESSION_WAIT_DEFAULT
+    seconds = flux.util.parse_fsd(str(value))
+    if seconds <= 0:
+        raise ValueError("session wait must be more than zero, not {!r}".format(value))
+    return seconds
+
+
+_submit_async = None
+
+
+def install_scout_submitter():
+    """Submit the scout right after the user's job, once its id is known.
+
+    The flux CLI has no hook that runs after submit, but every submit, run,
+    batch, alloc and bulksubmit goes through flux.job.submit_async. So this
+    wraps it for this process only. A held classical jobspec is submitted as
+    usual, and as soon as its id comes back the scout is submitted with that
+    id as its partner. Any other jobspec passes through untouched.
+    """
+    global _submit_async
+    if _submit_async is not None:
+        return
+    _submit_async = flux.job.submit_async
+
+    def submit_async(flux_handle, jobspec, *args, **kwargs):
+        future = _submit_async(flux_handle, jobspec, *args, **kwargs)
+        spec = held_classical(jobspec)
+        if spec is None:
+            return future
+        return PairFuture(future, flux_handle, spec)
+
+    flux.job.submit_async = submit_async
+
+
+class PairFuture:
+    """The user's submit future, which submits the scout when it resolves.
+
+    It cannot wait on the future itself. A flux future that was read
+    synchronously never runs a callback added later, and flux submit adds
+    one. So the scout goes in from that callback, or from get_id for the
+    commands that wait synchronously, whichever comes first.
+    """
+
+    def __init__(self, future, handle, spec):
+        self._future = future
+        self._handle = handle
+        self._spec = spec
+        self._paired = False
+
+    def _pair(self):
+        if self._paired:
+            return
+        self._paired = True
+        try:
+            jobid = self._future.get_id()
+        except OSError:
+            # The CLI reports the failed submit, and there is no partner.
+            return
+        submit_scout(self._handle, self._spec, jobid)
+
+    def get_id(self):
+        self._pair()
+        return self._future.get_id()
+
+    def then(self, callback, *args, **kwargs):
+        def paired(_future):
+            self._pair()
+            callback(self, *args, **kwargs)
+
+        self._future.then(paired)
+        return self
+
+    def __getattr__(self, name):
+        return getattr(self._future, name)
+
+
+def held_classical(jobspec):
+    """Return the jobspec as a dict if it is the held half of a scout pair."""
+    try:
+        if hasattr(jobspec, "jobspec"):
+            spec = jobspec.jobspec
+        elif isinstance(jobspec, dict):
+            spec = jobspec
+        else:
+            spec = json.loads(jobspec)
+    except (TypeError, ValueError):
+        return None
+    system = (spec.get("attributes") or {}).get("system") or {}
+    qfw = system.get("qfw") or {}
+    if system.get("hold") and qfw.get("pair") == "classical":
+        return spec
+    return None
+
+
+def submit_scout(handle, spec, partner):
+    """Submit the scout job for the held job partner and return its id.
 
     The scout asks for one core and the exclusive qpu, so it waits in the
     queue like any job and only runs while it holds a lease. It has the same
-    envelope and backend as the user's job and the same time limit. Its
-    program is flux-qfw scout, which finds the user's job by the qfw.scout
-    attribute the plugin writes after this returns.
+    envelope and backend as the user's job, and partner in its qfw.partner,
+    so it knows whom it serves. The scout's id is memoed onto the partner as
+    qfw_scout.
 
-    The flux CLI has no hook that runs after submit, so the scout is
-    submitted from here. If the user's job then fails to submit, the scout
-    finds no partner and exits after a minute.
+    The scout's clock starts before the user's job does, because it covers
+    the wait for the vendor too. So its time limit is the session wait plus
+    the user's duration, or the scout would end, and take the session with
+    it, while the user's job still runs. With no duration it has no limit.
+
+    If the scout cannot be submitted the partner is cancelled, since nothing
+    would ever release it.
     """
+    system = spec["attributes"]["system"]
+    attr = system["qfw"]
+    envelope = Envelope.from_attr(attr)
     scout = JobspecV1.from_command(
         [attr["python"], "-m", "flux_qfw.cli", "scout"],
         num_tasks=1,
@@ -284,32 +439,43 @@ def submit_scout(jobspec, envelope, attr, classical):
         cores_per_task=1,
     )
     scout.setattr("system.job.name", "scout:{}".format(envelope.qpu))
-    system = jobspec.jobspec.get("attributes", {}).get("system", {}) or {}
     if system.get("duration"):
-        scout.duration = system["duration"]
+        scout.duration = attr["session_wait"] + system["duration"] + SCOUT_MARGIN
     if system.get("queue"):
         scout.setattr("system.queue", system["queue"])
-    env = dict(jobspec.environment or {})
+    env = dict(system.get("environment") or {})
     if attr.get("pythonpath"):
         env["PYTHONPATH"] = attr["pythonpath"]
     scout.environment = env
-    if jobspec.cwd:
-        scout.cwd = jobspec.cwd
+    if system.get("cwd"):
+        scout.cwd = system["cwd"]
     scout_attr = dict(attr)
     scout_attr["pair"] = "scout"
     scout_attr["hold"] = False
+    scout_attr["partner"] = int(partner)
     scout.setattr("system.qfw", scout_attr)
     scout.jobspec["resources"] = resources.add_device(
-        classical_foothold(classical), envelope.qpu, envelope.qpus
+        classical_foothold(spec["resources"]),
+        envelope.qpu,
+        envelope.qpus,
+        envelope.max_qubits,
     )
     try:
-        jobid = flux.job.submit(flux.Flux(), scout)
+        jobid = flux.job.submit(handle, scout)
+        handle.rpc(
+            "job-manager.memo",
+            {"id": int(partner), "volatile": False, "memo": {"qfw_scout": int(jobid)}},
+        ).get()
     except Exception as error:
-        raise SystemExit(
-            "flux-qfw: could not submit the scout job for {}: {}".format(
-                envelope.qpu, error
-            )
+        flux.job.cancel(
+            handle, partner, "flux-qfw: no scout for {}: {}".format(envelope.qpu, error)
         )
+        print(
+            "flux-qfw: could not submit the scout job for {}, so job {} was "
+            "cancelled: {}".format(envelope.qpu, flux.job.JobID(partner).f58, error),
+            file=sys.stderr,
+        )
+        return None
     print(
         "flux-qfw: scout job {} submitted for {}".format(
             flux.job.JobID(jobid).f58, envelope.qpu
@@ -322,14 +488,17 @@ def submit_scout(jobspec, envelope, attr, classical):
 def classical_foothold(classical):
     """Return a one core request with the same levels as the classical one.
 
-    Keeping the same levels means it matches the same graph.
+    Keeping the same levels means it matches the same graph. It never asks
+    for a whole node, even when the classical job does.
     """
     entry = copy.deepcopy(classical[0])
     entry["count"] = 1
+    entry.pop("exclusive", None)
     node = entry
     while node.get("with"):
         child = node["with"][0]
         child["count"] = 1
+        child.pop("exclusive", None)
         node["with"] = [child]
         node = child
     return [entry]

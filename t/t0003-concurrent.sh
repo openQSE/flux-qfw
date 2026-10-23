@@ -15,9 +15,9 @@ export FLUX_QFW_MOCK_DIR="$WORK/mock"
 # A fixed size node, so the result does not depend on how many cores this
 # machine has. load_fluxion sets noverify, so the cores need not exist.
 flux R encode --hosts="$(hostname)" --cores=0-7 --property=normal:0 > "$WORK/R.json"
-python3 -m flux_qfw.cli add --r "$WORK/R.json" --output "$WORK/R-q.json" fake-iqm=2 nwqsim
+python3 -m flux_qfw.cli add --r "$WORK/R.json" --output "$WORK/R-q.json" fake-iqm=2:20 nwqsim:32
 QMANAGER_POLICY=coschedule load_fluxion "$WORK/R-q.json"
-python3 -m flux_qfw.cli devices | grep -q '^fake-iqm qpus=2$' || fail "fake-iqm has 2 qpus"
+grep -q '^fake-iqm qpus=2 qubits=20$' <<<"$(python3 -m flux_qfw.cli devices)" || fail "fake-iqm has 2 qpus"
 
 # Each job prints its reservation and keeps it for a few seconds.
 job() { flux submit -N1 -n1 --qfw-qpu="$1" sh -c 'echo "$FLUX_JOB_ID $QFW_RESERVATIONS"; sleep 4'; }
