@@ -1,5 +1,7 @@
 # flux-qfw
 
+[![PyPI version](https://badge.fury.io/py/flux-qfw.svg)](https://badge.fury.io/py/flux-qfw)
+
 > QFw quantum devices as Fluxion resources.
 
 flux-qfw is the Flux version of [qfw-slurm](https://github.com/openQSE/qfw-slurm). While the qfw-slurm reserves devices before Slurm grants the job, flux-qfw puts each QFw QPM into the Fluxion resource graph, next to the compute nodes, and lets Fluxion schedule it like a core. The flux submit (and similar) client is updated to ask for the device:
